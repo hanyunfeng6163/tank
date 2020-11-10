@@ -16,6 +16,7 @@ type UserController struct {
 	BaseController
 	preferenceService *PreferenceService
 	userService       *UserService
+	matterService     *MatterService
 }
 
 func (this *UserController) Init() {
@@ -31,15 +32,22 @@ func (this *UserController) Init() {
 		this.userService = b
 	}
 
+	b = core.CONTEXT.GetBean(this.matterService)
+	if b, ok := b.(*MatterService); ok {
+		this.matterService = b
+	}
+
 }
 
 func (this *UserController) RegisterRoutes() map[string]func(writer http.ResponseWriter, request *http.Request) {
 
 	routeMap := make(map[string]func(writer http.ResponseWriter, request *http.Request))
 
+	routeMap["/api/user/info"] = this.Wrap(this.Info, USER_ROLE_GUEST)
 	routeMap["/api/user/login"] = this.Wrap(this.Login, USER_ROLE_GUEST)
 	routeMap["/api/user/authentication/login"] = this.Wrap(this.AuthenticationLogin, USER_ROLE_GUEST)
 	routeMap["/api/user/register"] = this.Wrap(this.Register, USER_ROLE_GUEST)
+	routeMap["/api/user/create"] = this.Wrap(this.Create, USER_ROLE_ADMINISTRATOR)
 	routeMap["/api/user/edit"] = this.Wrap(this.Edit, USER_ROLE_USER)
 	routeMap["/api/user/detail"] = this.Wrap(this.Detail, USER_ROLE_USER)
 	routeMap["/api/user/logout"] = this.Wrap(this.Logout, USER_ROLE_GUEST)
@@ -48,6 +56,8 @@ func (this *UserController) RegisterRoutes() map[string]func(writer http.Respons
 	routeMap["/api/user/page"] = this.Wrap(this.Page, USER_ROLE_ADMINISTRATOR)
 	routeMap["/api/user/toggle/status"] = this.Wrap(this.ToggleStatus, USER_ROLE_ADMINISTRATOR)
 	routeMap["/api/user/transfiguration"] = this.Wrap(this.Transfiguration, USER_ROLE_ADMINISTRATOR)
+	routeMap["/api/user/scan"] = this.Wrap(this.Scan, USER_ROLE_ADMINISTRATOR)
+	routeMap["/api/user/delete"] = this.Wrap(this.Delete, USER_ROLE_ADMINISTRATOR)
 
 	return routeMap
 }
@@ -130,6 +140,12 @@ func (this *UserController) AuthenticationLogin(writer http.ResponseWriter, requ
 	return this.Success(user)
 }
 
+//fetch current user's info.
+func (this *UserController) Info(writer http.ResponseWriter, request *http.Request) *result.WebResult {
+	user := this.checkUser(request)
+	return this.Success(user)
+}
+
 //register by username and password. After registering, will auto login.
 func (this *UserController) Register(writer http.ResponseWriter, request *http.Request) *result.WebResult {
 
@@ -154,17 +170,78 @@ func (this *UserController) Register(writer http.ResponseWriter, request *http.R
 	}
 
 	user := &User{
-		Role:      USER_ROLE_USER,
-		Username:  username,
-		Password:  util.GetBcrypt(password),
-		SizeLimit: preference.DefaultTotalSizeLimit,
-		Status:    USER_STATUS_OK,
+		Role:           USER_ROLE_USER,
+		Username:       username,
+		Password:       util.GetBcrypt(password),
+		TotalSizeLimit: preference.DefaultTotalSizeLimit,
+		Status:         USER_STATUS_OK,
 	}
 
 	user = this.userDao.Create(user)
 
 	//auto login
 	this.innerLogin(writer, request, user)
+
+	return this.Success(user)
+}
+
+func (this *UserController) Create(writer http.ResponseWriter, request *http.Request) *result.WebResult {
+
+	username := request.FormValue("username")
+	password := request.FormValue("password")
+	role := request.FormValue("role")
+	sizeLimitStr := request.FormValue("sizeLimit")
+	totalSizeLimitStr := request.FormValue("totalSizeLimit")
+
+	//only admin can edit user's sizeLimit
+	var sizeLimit int64 = 0
+	if sizeLimitStr == "" {
+		panic("user's limit size is required")
+	} else {
+		intSizeLimit, err := strconv.Atoi(sizeLimitStr)
+		if err != nil {
+			this.PanicError(err)
+		}
+		sizeLimit = int64(intSizeLimit)
+	}
+
+	var totalSizeLimit int64 = 0
+	if totalSizeLimitStr == "" {
+		panic("user's total limit size is required")
+	} else {
+		intTotalSizeLimit, err := strconv.Atoi(totalSizeLimitStr)
+		if err != nil {
+			this.PanicError(err)
+		}
+		totalSizeLimit = int64(intTotalSizeLimit)
+	}
+
+	if m, _ := regexp.MatchString(USERNAME_PATTERN, username); !m {
+		panic(result.BadRequestI18n(request, i18n.UsernameError))
+	}
+
+	if len(password) < 6 {
+		panic(result.BadRequestI18n(request, i18n.UserPasswordLengthError))
+	}
+
+	if this.userDao.CountByUsername(username) > 0 {
+		panic(result.BadRequestI18n(request, i18n.UsernameExist, username))
+	}
+
+	if role != USER_ROLE_USER && role != USER_ROLE_ADMINISTRATOR {
+		role = USER_ROLE_USER
+	}
+
+	user := &User{
+		Username:       username,
+		Password:       util.GetBcrypt(password),
+		Role:           role,
+		SizeLimit:      sizeLimit,
+		TotalSizeLimit: totalSizeLimit,
+		Status:         USER_STATUS_OK,
+	}
+
+	user = this.userDao.Create(user)
 
 	return this.Success(user)
 }
@@ -217,6 +294,9 @@ func (this *UserController) Edit(writer http.ResponseWriter, request *http.Reque
 	}
 
 	currentUser = this.userDao.Save(currentUser)
+
+	//remove cache user.
+	this.userService.RemoveCacheUserByUuid(currentUser.Uuid)
 
 	return this.Success(currentUser)
 }
@@ -320,7 +400,7 @@ func (this *UserController) ToggleStatus(writer http.ResponseWriter, request *ht
 	currentUser := this.userDao.CheckByUuid(uuid)
 	user := this.checkUser(request)
 	if uuid == user.Uuid {
-		panic(result.UNAUTHORIZED)
+		panic(result.BadRequest("You cannot disable yourself."))
 	}
 
 	if currentUser.Status == USER_STATUS_OK {
@@ -331,11 +411,8 @@ func (this *UserController) ToggleStatus(writer http.ResponseWriter, request *ht
 
 	currentUser = this.userDao.Save(currentUser)
 
-	cacheUsers := this.userService.FindCacheUsersByUuid(currentUser.Uuid)
-	this.logger.Info("find %d cache users", len(cacheUsers))
-	for _, u := range cacheUsers {
-		u.Status = currentUser.Status
-	}
+	//remove cache user.
+	this.userService.RemoveCacheUserByUuid(currentUser.Uuid)
 
 	return this.Success(currentUser)
 
@@ -360,6 +437,35 @@ func (this *UserController) Transfiguration(writer http.ResponseWriter, request 
 	session = this.sessionDao.Create(session)
 
 	return this.Success(session.Uuid)
+}
+
+//scan user's physics files. create index into EyeblueTank
+func (this *UserController) Scan(writer http.ResponseWriter, request *http.Request) *result.WebResult {
+
+	uuid := request.FormValue("uuid")
+	currentUser := this.userDao.CheckByUuid(uuid)
+	this.matterService.DeleteByPhysics(request, currentUser)
+	this.matterService.ScanPhysics(request, currentUser)
+
+	return this.Success("OK")
+}
+
+func (this *UserController) Delete(writer http.ResponseWriter, request *http.Request) *result.WebResult {
+
+	uuid := request.FormValue("uuid")
+	currentUser := this.userDao.CheckByUuid(uuid)
+	user := this.checkUser(request)
+
+	if currentUser.Status != USER_STATUS_DISABLED {
+		panic(result.BadRequest("Only disabled user can be deleted."))
+	}
+	if currentUser.Uuid == user.Uuid {
+		panic(result.BadRequest("You cannot delete yourself."))
+	}
+
+	this.userService.DeleteUser(request, currentUser)
+
+	return this.Success("OK")
 }
 
 func (this *UserController) ChangePassword(writer http.ResponseWriter, request *http.Request) *result.WebResult {

@@ -1,18 +1,13 @@
 module github.com/eyebluecn/tank
 
-go 1.12
+go 1.14
 
 require (
-	github.com/disintegration/imaging v1.6.0
-	github.com/erikstmartin/go-testdb v0.0.0-20160219214506-8d10e4a1bae5 // indirect
-	github.com/go-sql-driver/mysql v1.4.1
-	github.com/jinzhu/gorm v1.9.4
-	github.com/jinzhu/now v1.0.0 // indirect
-	github.com/json-iterator/go v1.1.6
-	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
-	github.com/modern-go/reflect2 v1.0.1 // indirect
-	github.com/nu7hatch/gouuid v0.0.0-20131221200532-179d4d0c4d8d
-	github.com/robfig/cron v0.0.0-20180505203441-b41be1df6967
-	golang.org/x/crypto v0.0.0-20190325154230-a5d413f7728c
-	golang.org/x/text v0.3.1-0.20180807135948-17ff2d5776d2
+	github.com/disintegration/imaging v1.6.2
+	github.com/go-sql-driver/mysql v1.5.0
+	github.com/jinzhu/gorm v1.9.14
+	github.com/json-iterator/go v1.1.10
+	github.com/robfig/cron/v3 v3.0.1
+	golang.org/x/crypto v0.0.0-20200709230013-948cd5f35899
+	golang.org/x/text v0.3.3
 )

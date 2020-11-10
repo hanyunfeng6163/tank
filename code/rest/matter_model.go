@@ -6,9 +6,11 @@ import (
 	"github.com/eyebluecn/tank/code/tool/i18n"
 	"github.com/eyebluecn/tank/code/tool/result"
 	"github.com/eyebluecn/tank/code/tool/util"
+	jsoniter "github.com/json-iterator/go"
 	"net/http"
 	"regexp"
 	"strings"
+	"time"
 )
 
 const (
@@ -29,18 +31,22 @@ const (
  */
 type Matter struct {
 	Base
-	Puuid    string    `json:"puuid" gorm:"type:char(36);index:idx_puuid"`
-	UserUuid string    `json:"userUuid" gorm:"type:char(36);index:idx_uu"`
-	Username string    `json:"username" gorm:"type:varchar(45) not null"`
-	Dir      bool      `json:"dir" gorm:"type:tinyint(1) not null;default:0"`
-	Name     string    `json:"name" gorm:"type:varchar(255) not null"`
-	Md5      string    `json:"md5" gorm:"type:varchar(45)"`
-	Size     int64     `json:"size" gorm:"type:bigint(20) not null;default:0"`
-	Privacy  bool      `json:"privacy" gorm:"type:tinyint(1) not null;default:0"`
-	Path     string    `json:"path" gorm:"type:varchar(1024)"`
-	Times    int64     `json:"times" gorm:"type:bigint(20) not null;default:0"`
-	Parent   *Matter   `json:"parent" gorm:"-"`
-	Children []*Matter `json:"-" gorm:"-"`
+	Puuid      string    `json:"puuid" gorm:"type:char(36);index:idx_puuid"`
+	UserUuid   string    `json:"userUuid" gorm:"type:char(36);index:idx_uu"`
+	Username   string    `json:"username" gorm:"type:varchar(45) not null"`
+	Dir        bool      `json:"dir" gorm:"type:tinyint(1) not null;default:0"`
+	Name       string    `json:"name" gorm:"type:varchar(255) not null"`
+	Md5        string    `json:"md5" gorm:"type:varchar(45)"`
+	Size       int64     `json:"size" gorm:"type:bigint(20) not null;default:0"`
+	Privacy    bool      `json:"privacy" gorm:"type:tinyint(1) not null;default:0"`
+	Path       string    `json:"path" gorm:"type:varchar(1024)"`
+	Times      int64     `json:"times" gorm:"type:bigint(20) not null;default:0"`
+	Parent     *Matter   `json:"parent" gorm:"-"`
+	Children   []*Matter `json:"-" gorm:"-"`
+	Prop       string    `json:"prop" gorm:"type:varchar(1024) not null;default:'{}'"`
+	VisitTime  time.Time `json:"visitTime" gorm:"type:timestamp not null;default:'2018-01-01 00:00:00'"`
+	Deleted    bool      `json:"deleted" gorm:"type:tinyint(1) not null;index:idx_del;default:0"`
+	DeleteTime time.Time `json:"deleteTime" gorm:"type:timestamp not null;index:idx_delt;default:'2018-01-01 00:00:00'"`
 }
 
 // set File's table name to be `profiles`
@@ -67,8 +73,17 @@ func NewRootMatter(user *User) *Matter {
 	matter.Path = ""
 	matter.CreateTime = user.CreateTime
 	matter.UpdateTime = user.UpdateTime
+	matter.VisitTime = user.UpdateTime
 
 	return matter
+}
+
+//get user's space absolute path
+func GetUserSpaceRootDir(username string) (rootDirPath string) {
+
+	rootDirPath = fmt.Sprintf("%s/%s", core.CONFIG.MatterPath(), username)
+
+	return rootDirPath
 }
 
 //get user's root absolute path
@@ -112,4 +127,32 @@ func CheckMatterName(request *http.Request, name string) string {
 		panic(result.BadRequestI18n(request, i18n.MatterNameLengthExceedLimit, len(name), MATTER_NAME_MAX_LENGTH))
 	}
 	return name
+}
+
+//fetch the props
+func (this *Matter) FetchPropMap() map[string]string {
+
+	m := make(map[string]string)
+	json := this.Prop
+	if json == "" {
+		json = EMPTY_JSON_MAP
+	}
+
+	err := jsoniter.ConfigCompatibleWithStandardLibrary.Unmarshal([]byte(json), &m)
+	if err != nil {
+		panic(err)
+	}
+
+	return m
+}
+
+//fetch the props
+func (this *Matter) SetPropMap(propMap map[string]string) {
+
+	b, err := jsoniter.ConfigCompatibleWithStandardLibrary.Marshal(propMap)
+	if err != nil {
+		panic(err)
+	}
+
+	this.Prop = string(b)
 }

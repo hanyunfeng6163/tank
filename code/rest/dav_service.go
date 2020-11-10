@@ -7,11 +7,14 @@ import (
 	"github.com/eyebluecn/tank/code/tool/dav/xml"
 	"github.com/eyebluecn/tank/code/tool/result"
 	"github.com/eyebluecn/tank/code/tool/util"
+	"github.com/eyebluecn/tank/code/tool/webdav"
+	"io/ioutil"
 	"net/http"
 	"net/url"
 	"path"
 	"regexp"
 	"strings"
+	"time"
 )
 
 /**
@@ -26,6 +29,7 @@ type DavService struct {
 	BaseBean
 	matterDao     *MatterDao
 	matterService *MatterService
+	lockSystem    webdav.LockSystem
 }
 
 func (this *DavService) Init() {
@@ -41,6 +45,8 @@ func (this *DavService) Init() {
 		this.matterService = b
 	}
 
+	// init the webdav lock system.
+	this.lockSystem = webdav.NewMemLS()
 }
 
 //get the depth in header. Not support infinity yet.
@@ -87,7 +93,8 @@ func (this *DavService) PropstatsFromXmlNames(user *User, matter *Matter, xmlNam
 
 	propstats := make([]dav.Propstat, 0)
 
-	var properties []dav.Property
+	var okProperties []dav.Property
+	var notFoundProperties []dav.Property
 
 	for _, xmlName := range xmlNames {
 		//TODO: deadprops not implement yet.
@@ -96,22 +103,48 @@ func (this *DavService) PropstatsFromXmlNames(user *User, matter *Matter, xmlNam
 		if liveProp := LivePropMap[xmlName]; liveProp.findFn != nil && (liveProp.dir || !matter.Dir) {
 			innerXML := liveProp.findFn(user, matter)
 
-			properties = append(properties, dav.Property{
+			okProperties = append(okProperties, dav.Property{
 				XMLName:  xmlName,
 				InnerXML: []byte(innerXML),
 			})
 		} else {
-			this.logger.Info("%s %s cannot finish.", matter.Path, xmlName.Local)
+			this.logger.Info("handle props %s %s.", matter.Path, xmlName.Local)
+
+			propMap := matter.FetchPropMap()
+			if value, isPresent := propMap[xmlName.Local]; isPresent {
+				okProperties = append(okProperties, dav.Property{
+					XMLName:  xmlName,
+					InnerXML: []byte(value),
+				})
+			} else {
+
+				//only accept Space not null.
+				if xmlName.Space != "" {
+
+					//collect not found props
+					notFoundProperties = append(notFoundProperties, dav.Property{
+						XMLName:  xmlName,
+						InnerXML: []byte(""),
+					})
+				}
+
+			}
 		}
 	}
 
-	if len(properties) == 0 {
+	if len(okProperties) == 0 && len(notFoundProperties) == 0 {
 		panic(result.BadRequest("cannot parse request properties"))
 	}
 
-	okPropstat := dav.Propstat{Status: http.StatusOK, Props: properties}
+	if len(okProperties) != 0 {
+		okPropstat := dav.Propstat{Status: http.StatusOK, Props: okProperties}
+		propstats = append(propstats, okPropstat)
+	}
 
-	propstats = append(propstats, okPropstat)
+	if len(notFoundProperties) != 0 {
+		notFoundPropstat := dav.Propstat{Status: http.StatusNotFound, Props: notFoundProperties}
+		propstats = append(propstats, notFoundPropstat)
+	}
 
 	return propstats
 
@@ -154,6 +187,7 @@ func (this *DavService) HandlePropfind(writer http.ResponseWriter, request *http
 
 	fmt.Printf("PROPFIND %s\n", subPath)
 
+	// read depth
 	depth := this.ParseDepth(request)
 
 	propfind := dav.ReadPropfind(request.Body)
@@ -166,7 +200,7 @@ func (this *DavService) HandlePropfind(writer http.ResponseWriter, request *http
 		matters = []*Matter{matter}
 	} else {
 		// len(matters) == 0 means empty directory
-		matters = this.matterDao.FindByPuuidAndUserUuid(matter.Uuid, user.Uuid, nil)
+		matters = this.matterDao.FindByPuuidAndUserUuidAndDeleted(matter.Uuid, user.Uuid, FALSE, nil)
 
 		//add this matter to head.
 		matters = append([]*Matter{matter}, matters...)
@@ -194,6 +228,74 @@ func (this *DavService) HandlePropfind(writer http.ResponseWriter, request *http
 
 }
 
+//change the file's property
+func (this *DavService) HandleProppatch(writer http.ResponseWriter, request *http.Request, user *User, subPath string) {
+
+	fmt.Printf("PROPPATCH %s\n", subPath)
+
+	// handle the lock feature.
+	reqPath, status, err := this.stripPrefix(request.URL.Path)
+	if err != nil {
+		panic(result.StatusCodeWebResult(status, err.Error()))
+	}
+	release, status, err := this.confirmLocks(request, reqPath, "")
+	if err != nil {
+		panic(result.StatusCodeWebResult(status, err.Error()))
+	}
+	if release != nil {
+		defer release()
+	}
+
+	matter := this.matterDao.checkByUserUuidAndPath(user.Uuid, subPath)
+
+	patches, status, err := webdav.ReadProppatch(request.Body)
+	this.PanicError(err)
+
+	fmt.Println("status:%v", status)
+
+	//prepare a multiStatusWriter.
+	multiStatusWriter := &dav.MultiStatusWriter{Writer: writer}
+
+	propstats := make([]dav.Propstat, 0)
+	propMap := matter.FetchPropMap()
+	for _, patch := range patches {
+		propStat := dav.Propstat{Status: http.StatusOK}
+		if patch.Remove {
+
+			if len(patch.Props) > 0 {
+				property := patch.Props[0]
+				if _, isPresent := propMap[property.XMLName.Local]; isPresent {
+					//delete the prop.
+					delete(propMap, property.XMLName.Local)
+				}
+			}
+		} else {
+			for _, prop := range patch.Props {
+				propMap[prop.XMLName.Local] = string(prop.InnerXML)
+
+				propStat.Props = append(propStat.Props, dav.Property{XMLName: xml.Name{Space: prop.XMLName.Space, Local: prop.XMLName.Local}})
+
+			}
+		}
+
+		propstats = append(propstats, propStat)
+
+	}
+	matter.SetPropMap(propMap)
+	// update the matter
+	this.matterDao.Save(matter)
+
+	visitPath := fmt.Sprintf("%s%s", WEBDAV_PREFIX, matter.Path)
+	response := this.makePropstatResponse(visitPath, propstats)
+
+	err1 := multiStatusWriter.Write(response)
+	this.PanicError(err1)
+
+	err2 := multiStatusWriter.Close()
+	this.PanicError(err2)
+
+}
+
 //handle download
 func (this *DavService) HandleGetHeadPost(writer http.ResponseWriter, request *http.Request, user *User, subPath string) {
 
@@ -217,6 +319,23 @@ func (this *DavService) HandlePut(writer http.ResponseWriter, request *http.Requ
 
 	fmt.Printf("PUT %s\n", subPath)
 
+	// handle the lock feature.
+	reqPath, status, err := this.stripPrefix(request.URL.Path)
+	if err != nil {
+		panic(result.StatusCodeWebResult(status, err.Error()))
+	}
+	release, status, err := this.confirmLocks(request, reqPath, "")
+	if err != nil {
+
+		//if status == http.StatusLocked {
+		//	status = http.StatusPreconditionFailed
+		//}
+		panic(result.StatusCodeWebResult(status, err.Error()))
+	}
+	if release != nil {
+		defer release()
+	}
+
 	filename := util.GetFilenameOfPath(subPath)
 	dirPath := util.GetDirOfPath(subPath)
 
@@ -230,16 +349,31 @@ func (this *DavService) HandlePut(writer http.ResponseWriter, request *http.Requ
 
 	this.matterService.Upload(request, request.Body, user, dirMatter, filename, true)
 
+	//set the status code 201
+	writer.WriteHeader(http.StatusCreated)
+
 }
 
 //delete file
-func (this *DavService) HandleDelete(writer http.ResponseWriter, request *http.Request, user *User, subPath string) {
+func (this *DavService) HandleDelete(w http.ResponseWriter, r *http.Request, user *User, subPath string) {
 
 	fmt.Printf("DELETE %s\n", subPath)
 
+	reqPath, status, err := this.stripPrefix(r.URL.Path)
+	if err != nil {
+		panic(result.StatusCodeWebResult(status, err.Error()))
+	}
+	release, status, err := this.confirmLocks(r, reqPath, "")
+	if err != nil {
+		panic(result.StatusCodeWebResult(status, err.Error()))
+	}
+	if release != nil {
+		defer release()
+	}
+
 	matter := this.matterDao.CheckWithRootByPath(subPath, user)
 
-	this.matterService.AtomicDelete(request, matter, user)
+	this.matterService.AtomicSoftDelete(r, matter, user)
 }
 
 //crate a directory
@@ -247,10 +381,37 @@ func (this *DavService) HandleMkcol(writer http.ResponseWriter, request *http.Re
 
 	fmt.Printf("MKCOL %s\n", subPath)
 
+	//the body of MKCOL request MUST be empty. (RFC2518:8.3.1)
+	bodyBytes, err := ioutil.ReadAll(request.Body)
+	if err != nil {
+		fmt.Println("occur error when reading body: " + err.Error())
+	} else {
+		if len(bodyBytes) != 0 {
+			//throw conflict error
+			panic(result.CustomWebResult(result.UNSUPPORTED_MEDIA_TYPE, fmt.Sprintf("%s MKCOL should NO body", subPath)))
+		}
+	}
+
 	thisDirName := util.GetFilenameOfPath(subPath)
 	dirPath := util.GetDirOfPath(subPath)
 
-	dirMatter := this.matterDao.CheckWithRootByPath(dirPath, user)
+	dirMatter := this.matterDao.FindWithRootByPath(dirPath, user)
+	if dirMatter == nil {
+		//throw conflict error
+		panic(result.CustomWebResult(result.CONFLICT, fmt.Sprintf("%s not exist", dirPath)))
+	}
+
+	//check whether col exists. (RFC2518:8.3.1)
+	dbMatter := this.matterDao.FindByUserUuidAndPuuidAndDirAndName(user.Uuid, dirMatter.Uuid, TRUE, thisDirName)
+	if dbMatter != nil {
+		panic(result.CustomWebResult(result.METHOD_NOT_ALLOWED, fmt.Sprintf("%s already exists", dirPath)))
+	}
+
+	//check whether file exists. (RFC2518:8.3.1)
+	fileMatter := this.matterDao.FindByUserUuidAndPuuidAndDirAndName(user.Uuid, dirMatter.Uuid, FALSE, thisDirName)
+	if fileMatter != nil {
+		panic(result.CustomWebResult(result.METHOD_NOT_ALLOWED, fmt.Sprintf("%s file already exists", dirPath)))
+	}
 
 	this.matterService.AtomicCreateDirectory(request, dirMatter, thisDirName, user)
 
@@ -352,7 +513,11 @@ func (this *DavService) prepareMoveCopy(
 		panic(result.BadRequest("you cannot move the root directory"))
 	}
 
-	destDirMatter = this.matterDao.CheckWithRootByPath(destinationDirPath, user)
+	destDirMatter = this.matterDao.FindWithRootByPath(destinationDirPath, user)
+	if destDirMatter == nil {
+		//throw conflict error
+		panic(result.CustomWebResult(result.CONFLICT, fmt.Sprintf("%s not exist", destinationDirPath)))
+	}
 
 	return srcMatter, destDirMatter, srcDirPath, destinationDirPath, destinationName, overwrite
 
@@ -363,16 +528,38 @@ func (this *DavService) HandleMove(writer http.ResponseWriter, request *http.Req
 
 	fmt.Printf("MOVE %s\n", subPath)
 
+	// handle the lock feature.
+	reqPath, status, err := this.stripPrefix(request.URL.Path)
+	if err != nil {
+		panic(result.StatusCodeWebResult(status, err.Error()))
+	}
+	release, status, err := this.confirmLocks(request, reqPath, "")
+	if err != nil {
+		panic(result.StatusCodeWebResult(status, err.Error()))
+	}
+	if release != nil {
+		defer release()
+	}
+
 	srcMatter, destDirMatter, srcDirPath, destinationDirPath, destinationName, overwrite := this.prepareMoveCopy(writer, request, user, subPath)
+
 	//move to the new directory
 	if destinationDirPath == srcDirPath {
 		//if destination path not change. it means rename.
-		this.matterService.AtomicRename(request, srcMatter, destinationName, user)
+		this.matterService.AtomicRename(request, srcMatter, destinationName, overwrite, user)
 	} else {
 		this.matterService.AtomicMove(request, srcMatter, destDirMatter, overwrite, user)
 	}
 
 	this.logger.Info("finish moving %s => %s", subPath, destDirMatter.Path)
+
+	if overwrite {
+		//overwrite old. set the status code 204
+		writer.WriteHeader(http.StatusNoContent)
+	} else {
+		//copy new. set the status code 201
+		writer.WriteHeader(http.StatusCreated)
+	}
 }
 
 //copy file/directory
@@ -382,29 +569,245 @@ func (this *DavService) HandleCopy(writer http.ResponseWriter, request *http.Req
 
 	srcMatter, destDirMatter, _, _, destinationName, overwrite := this.prepareMoveCopy(writer, request, user, subPath)
 
+	// handle the lock feature.
+	release, status, err := this.confirmLocks(request, destDirMatter.Path+"/"+destinationName, "")
+	if err != nil {
+		panic(result.StatusCodeWebResult(status, err.Error()))
+	}
+	if release != nil {
+		defer release()
+	}
+
 	//copy to the new directory
 	this.matterService.AtomicCopy(request, srcMatter, destDirMatter, destinationName, overwrite, user)
 
 	this.logger.Info("finish copying %s => %s", subPath, destDirMatter.Path)
 
+	if overwrite {
+		//overwrite old. set the status code 204
+		writer.WriteHeader(http.StatusNoContent)
+	} else {
+		//copy new. set the status code 201
+		writer.WriteHeader(http.StatusCreated)
+	}
+
+}
+
+func (h *DavService) stripPrefix(p string) (string, int, error) {
+	if r := strings.TrimPrefix(p, WEBDAV_PREFIX); len(r) < len(p) {
+		return r, http.StatusOK, nil
+	}
+	return p, http.StatusNotFound, webdav.ErrPrefixMismatch
+}
+
+func (h *DavService) lock(now time.Time, root string) (token string, status int, err error) {
+	token, err = h.lockSystem.Create(now, webdav.LockDetails{
+		Root:      root,
+		Duration:  webdav.InfiniteTimeout,
+		ZeroDepth: true,
+	})
+	if err != nil {
+		if err == webdav.ErrLocked {
+			return "", webdav.StatusLocked, err
+		}
+		return "", http.StatusInternalServerError, err
+	}
+	return token, 0, nil
+}
+
+func (h *DavService) confirmLocks(r *http.Request, src, dst string) (release func(), status int, err error) {
+	hdr := r.Header.Get("If")
+	if hdr == "" {
+		// An empty If header means that the client hasn't previously created locks.
+		// Even if this client doesn't care about locks, we still need to check that
+		// the resources aren't locked by another client, so we create temporary
+		// locks that would conflict with another client's locks. These temporary
+		// locks are unlocked at the end of the HTTP request.
+		now, srcToken, dstToken := time.Now(), "", ""
+		if src != "" {
+			srcToken, status, err = h.lock(now, src)
+			if err != nil {
+				return nil, status, err
+			}
+		}
+		if dst != "" {
+			dstToken, status, err = h.lock(now, dst)
+			if err != nil {
+				if srcToken != "" {
+					h.lockSystem.Unlock(now, srcToken)
+				}
+				return nil, status, err
+			}
+		}
+
+		return func() {
+			if dstToken != "" {
+				h.lockSystem.Unlock(now, dstToken)
+			}
+			if srcToken != "" {
+				h.lockSystem.Unlock(now, srcToken)
+			}
+		}, 0, nil
+	}
+
+	ih, ok := webdav.ParseIfHeader(hdr)
+	if !ok {
+		return nil, http.StatusBadRequest, webdav.ErrInvalidIfHeader
+	}
+	// ih is a disjunction (OR) of ifLists, so any IfList will do.
+	for _, l := range ih.Lists {
+		lsrc := l.ResourceTag
+		if lsrc == "" {
+			lsrc = src
+		} else {
+			u, err := url.Parse(lsrc)
+			if err != nil {
+				continue
+			}
+			if u.Host != r.Host {
+				continue
+			}
+			lsrc, status, err = h.stripPrefix(u.Path)
+			if err != nil {
+				return nil, status, err
+			}
+		}
+		release, err = h.lockSystem.Confirm(time.Now(), lsrc, dst, l.Conditions...)
+		if err == webdav.ErrConfirmationFailed {
+			continue
+		}
+		if err != nil {
+			return nil, http.StatusInternalServerError, err
+		}
+		return release, 0, nil
+	}
+	// Section 10.4.1 says that "If this header is evaluated and all state lists
+	// fail, then the request must fail with a 412 (Precondition Failed) status."
+	// We follow the spec even though the cond_put_corrupt_token test case from
+	// the litmus test warns on seeing a 412 instead of a 423 (Locked).
+	return nil, http.StatusLocked, webdav.ErrLocked
 }
 
 //lock.
-func (this *DavService) HandleLock(writer http.ResponseWriter, request *http.Request, user *User, subPath string) {
+func (this *DavService) HandleLock(w http.ResponseWriter, r *http.Request, user *User, subPath string) {
 
-	panic(result.BadRequest("not support LOCK yet."))
+	duration, err := webdav.ParseTimeout(r.Header.Get("Timeout"))
+	if err != nil {
+		panic(result.BadRequest(err.Error()))
+	}
+	li, status, err := webdav.ReadLockInfo(r.Body)
+	if err != nil {
+		panic(result.BadRequest(fmt.Sprintf("error:%s, status=%d", err.Error(), status)))
+	}
+
+	token, ld, now, created := "", webdav.LockDetails{}, time.Now(), false
+	if li == (webdav.LockInfo{}) {
+		// An empty LockInfo means to refresh the lock.
+		ih, ok := webdav.ParseIfHeader(r.Header.Get("If"))
+		if !ok {
+			panic(result.BadRequest(webdav.ErrInvalidIfHeader.Error()))
+		}
+		if len(ih.Lists) == 1 && len(ih.Lists[0].Conditions) == 1 {
+			token = ih.Lists[0].Conditions[0].Token
+		}
+		if token == "" {
+			panic(result.BadRequest(webdav.ErrInvalidLockToken.Error()))
+		}
+		ld, err = this.lockSystem.Refresh(now, token, duration)
+		if err != nil {
+			if err == webdav.ErrNoSuchLock {
+				panic(result.StatusCodeWebResult(http.StatusPreconditionFailed, err.Error()))
+			}
+			panic(result.StatusCodeWebResult(http.StatusInternalServerError, err.Error()))
+		}
+
+	} else {
+		// Section 9.10.3 says that "If no Depth header is submitted on a LOCK request,
+		// then the request MUST act as if a "Depth:infinity" had been submitted."
+		depth := webdav.InfiniteDepth
+		if hdr := r.Header.Get("Depth"); hdr != "" {
+			depth = webdav.ParseDepth(hdr)
+			if depth != 0 && depth != webdav.InfiniteDepth {
+				// Section 9.10.3 says that "Values other than 0 or infinity must not be
+				// used with the Depth header on a LOCK method".
+				panic(result.StatusCodeWebResult(http.StatusBadRequest, webdav.ErrInvalidDepth.Error()))
+			}
+		}
+
+		reqPath, status, err := this.stripPrefix(r.URL.Path)
+		if err != nil {
+			panic(result.StatusCodeWebResult(status, err.Error()))
+		}
+
+		ld = webdav.LockDetails{
+			Root:      reqPath,
+			Duration:  duration,
+			OwnerXML:  li.Owner.InnerXML,
+			ZeroDepth: depth == 0,
+		}
+		token, err = this.lockSystem.Create(now, ld)
+		if err != nil {
+			if err == webdav.ErrLocked {
+				panic(result.StatusCodeWebResult(http.StatusLocked, err.Error()))
+			}
+			panic(result.StatusCodeWebResult(http.StatusInternalServerError, err.Error()))
+		}
+		defer func() {
+			//when error occur, rollback.
+			//this.lockSystem.Unlock(now, token)
+		}()
+
+		// Create the resource if it didn't previously exist.
+		// ctx := r.Context()
+		//if _, err := this.FileSystem.Stat(ctx, subPath); err != nil {
+		//	f, err := h.FileSystem.OpenFile(ctx, reqPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
+		//	if err != nil {
+		//		// TODO: detect missing intermediate dirs and return http.StatusConflict?
+		//		return http.StatusInternalServerError, err
+		//	}
+		//	f.Close()
+		//	created = true
+		//}
+
+		// http://www.webdav.org/specs/rfc4918.html#HEADER_Lock-Token says that the
+		// Lock-Token value is a Coded-URL. We add angle brackets.
+		w.Header().Set("Lock-Token", "<"+token+">")
+	}
+
+	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	if created {
+		// This is "w.WriteHeader(http.StatusCreated)" and not "return
+		// http.StatusCreated, nil" because we write our own (XML) response to w
+		// and Handler.ServeHTTP would otherwise write "Created".
+		w.WriteHeader(http.StatusCreated)
+	}
+	_, _ = webdav.WriteLockInfo(w, token, ld)
+
 }
 
 //unlock
-func (this *DavService) HandleUnlock(writer http.ResponseWriter, request *http.Request, user *User, subPath string) {
+func (this *DavService) HandleUnlock(w http.ResponseWriter, r *http.Request, user *User, subPath string) {
 
-	panic(result.BadRequest("not support UNLOCK yet."))
-}
+	// http://www.webdav.org/specs/rfc4918.html#HEADER_Lock-Token says that the
+	// Lock-Token value is a Coded-URL. We strip its angle brackets.
+	t := r.Header.Get("Lock-Token")
+	if len(t) < 2 || t[0] != '<' || t[len(t)-1] != '>' {
+		panic(result.StatusCodeWebResult(http.StatusBadRequest, webdav.ErrInvalidLockToken.Error()))
+	}
+	t = t[1 : len(t)-1]
 
-//change the file's property
-func (this *DavService) HandleProppatch(writer http.ResponseWriter, request *http.Request, user *User, subPath string) {
-
-	panic(result.BadRequest("not support PROPPATCH yet."))
+	switch err := this.lockSystem.Unlock(time.Now(), t); err {
+	case nil:
+		panic(result.StatusCodeWebResult(http.StatusNoContent, ""))
+	case webdav.ErrForbidden:
+		panic(result.StatusCodeWebResult(http.StatusForbidden, err.Error()))
+	case webdav.ErrLocked:
+		panic(result.StatusCodeWebResult(http.StatusLocked, err.Error()))
+	case webdav.ErrNoSuchLock:
+		panic(result.StatusCodeWebResult(http.StatusConflict, err.Error()))
+	default:
+		panic(result.StatusCodeWebResult(http.StatusInternalServerError, err.Error()))
+	}
 }
 
 //hanle all the request.

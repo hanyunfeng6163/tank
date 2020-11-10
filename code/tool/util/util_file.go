@@ -128,7 +128,11 @@ func GetFilenameOfPath(fullPath string) string {
 func DeleteEmptyDir(dirPath string) bool {
 	dir, err := ioutil.ReadDir(dirPath)
 	if err != nil {
-		panic(result.BadRequest("occur error while reading %s %s", dirPath, err.Error()))
+		if strings.Contains(err.Error(), "The system cannot find") {
+			return false
+		} else {
+			panic(result.BadRequest("occur error while reading %s %s", dirPath, err.Error()))
+		}
 	}
 	if len(dir) == 0 {
 		//empty dir
@@ -238,4 +242,23 @@ func UniformPath(p string) string {
 	p = path.Clean(p)
 	p = strings.TrimSuffix(p, "/")
 	return p
+}
+
+// readDirNames reads the directory named by dirname and returns
+// see filepath.readDirNames
+func ReadDirNames(dirname string) ([]string, error) {
+	f, err := os.Open(dirname)
+	if err != nil {
+		return nil, err
+	}
+	names, err := f.Readdirnames(-1)
+	if err != nil {
+		return nil, err
+	}
+	err = f.Close()
+	if err != nil {
+		return nil, err
+	}
+
+	return names, nil
 }

@@ -9,10 +9,10 @@ const (
 
 	DEFAULT_SERVER_PORT = 6010
 
-	//db table's prefix. tank30_ means current version is tank:3.0.x
-	TABLE_PREFIX = "tank30_"
+	//db table's prefix. tank31_ means current version is tank:3.1.x
+	TABLE_PREFIX = "tank31_"
 
-	VERSION = "3.0.3"
+	VERSION = "3.1.1"
 )
 
 type Config interface {
@@ -23,5 +23,5 @@ type Config interface {
 	//files storage location.
 	MatterPath() string
 	//when installed by user. Write configs to tank.json
-	FinishInstall(mysqlPort int, mysqlHost string, mysqlSchema string, mysqlUsername string, mysqlPassword string)
+	FinishInstall(mysqlPort int, mysqlHost string, mysqlSchema string, mysqlUsername string, mysqlPassword string, mysqlCharset string)
 }
